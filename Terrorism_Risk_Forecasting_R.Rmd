@@ -1,0 +1,1181 @@
+---
+title: "Analyzing Global Terrorism Trends: Patterns, Lethality, and Forecasting (1970-2017)"
+author: "Group 14"
+date: "2025-04-11"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+ 
+This contains the loading of libraries and the two datasets: global terrorism and UN population. Then we process and clean the data by handling outliers and missing values, and performing some feature engineering, which includes renaming columns in terrorism dataset, creating a decade variable, creating a severity index using the nkill and nwound columns.
+
+```{r q, echo=TRUE}
+# Load required libraries
+library(tidyverse)
+library(gridExtra)
+library(readr)
+library(ggmap)
+library(rworldmap)
+library(arules)
+library(arulesViz)
+library(ggpubr)
+library(car)
+library(caret)
+library(forecast)
+library(zoo)
+library(ggfortify)
+library(naniar) # For missing value visualization
+
+# Load datasets
+fulldf <- read_csv("/Users/atharvraotole/Desktop/globalterr/globalterrorismdb_0718dist.csv")
+fullpop <- read_csv("/Users/atharvraotole/Desktop/globalterr/UNpopfile.csv")
+
+# Process population data
+pop <- fullpop %>%
+  select(-MidPeriod, -PopMale, -PopFemale, -VarID) %>%
+  filter(Time > 1969 & Variant == 'Medium' & Time < 2017) %>%
+  select(-Variant, -LocID)
+
+futurepop <- fullpop %>%
+  filter(Time > 2016 & Variant == 'Medium') %>%
+  select(-Variant, -LocID, -MidPeriod, -PopMale, -PopFemale, -VarID)
+
+# Select and rename columns in terrorism dataset
+df <- fulldf %>%
+  select(iyear, imonth, iday, country_txt, region_txt, city, latitude, longitude, 
+         summary, multiple, attacktype1_txt, targtype1_txt, targsubtype1_txt, 
+         gname, weaptype1_txt, nkill, nwound, nkillter) %>%
+  rename(year = iyear, month = imonth, day = iday, country = country_txt, 
+         region = region_txt, multiple_attack = multiple, attacktype = attacktype1_txt, 
+         target_type = targtype1_txt, target_sub_type = targsubtype1_txt, 
+         group_name = gname, weapon_type = weaptype1_txt)
+
+# Create decade variable
+df <- df %>%
+  mutate(decade = 
+           ifelse(year<1980, '70s', 
+                  ifelse(year < 1990, '80s', 
+                         ifelse(year < 2000, '90s', 
+                                ifelse(year < 2010, '2000s', '2010s')))))
+
+df$decade <- factor(df$decade, levels=c("70s", "80s", "90s", "2000s", "2010s"))
+
+# Check for missing values
+missing_values <- colSums(is.na(df))
+print(missing_values)
+
+# Handle missing values
+df <- df %>%
+  # Replace NA in categorical columns with "Unknown"
+  mutate(group_name = ifelse(is.na(group_name), "Unknown", group_name)) %>%
+  mutate(city = ifelse(is.na(city), "Unknown", city)) %>%
+  mutate(target_sub_type = ifelse(is.na(target_sub_type), "Unknown", target_sub_type)) %>%
+  mutate(summary = ifelse(is.na(summary), "No summary available", summary)) %>%
+  # Replace NA in multiple_attack with 0 (assuming 0 means no multiple attack)
+  mutate(multiple_attack = ifelse(is.na(multiple_attack), 0, multiple_attack)) %>%
+  # Replace NA in numerical columns with median values
+  mutate(
+    nkill = ifelse(is.na(nkill), median(nkill, na.rm = TRUE), nkill),
+    nwound = ifelse(is.na(nwound), median(nwound, na.rm = TRUE), nwound),
+    nkillter = ifelse(is.na(nkillter), median(nkillter, na.rm = TRUE), nkillter)
+  )
+
+# Handle missing coordinates using country/region medians
+df <- df %>%
+  # Create a flag for missing coordinates
+  mutate(coords_missing = is.na(latitude) | is.na(longitude))
+
+# Impute missing coordinates with country medians
+df <- df %>%
+  group_by(country) %>%
+  mutate(
+    latitude = ifelse(is.na(latitude), median(latitude, na.rm = TRUE), latitude),
+    longitude = ifelse(is.na(longitude), median(longitude, na.rm = TRUE), longitude)
+  ) %>%
+  ungroup()
+
+# For countries with all NA coordinates, use region medians
+df <- df %>%
+  group_by(region) %>%
+  mutate(
+    latitude = ifelse(is.na(latitude), median(latitude, na.rm = TRUE), latitude),
+    longitude = ifelse(is.na(longitude), median(longitude, na.rm = TRUE), longitude)
+  ) %>%
+  ungroup()
+
+# If there are still NAs, replace with global medians
+global_lat_median <- median(df$latitude, na.rm = TRUE)
+global_long_median <- median(df$longitude, na.rm = TRUE)
+
+df <- df %>%
+  mutate(
+    latitude = ifelse(is.na(latitude), global_lat_median, latitude),
+    longitude = ifelse(is.na(longitude), global_long_median, longitude)
+  )
+
+# Handle outliers using capping method for numerical columns
+cap_outliers <- function(x, lower_quantile = 0.05, upper_quantile = 0.95) {
+  qnt <- quantile(x, probs = c(lower_quantile, upper_quantile), na.rm = TRUE)
+  x[x < qnt[1]] <- qnt[1]
+  x[x > qnt[2]] <- qnt[2]
+  return(x)
+}
+
+# Only apply capping to columns with extreme outliers
+df <- df %>%
+  mutate(
+    nkill_capped = cap_outliers(nkill),
+    nwound_capped = cap_outliers(nwound),
+    nkillter_capped = cap_outliers(nkillter)
+  )
+
+# Create additional features for analysis
+df <- df %>%
+  # Create date column (handling missing month/day values)
+  mutate(
+    month = ifelse(month == 0 | is.na(month), 1, month),
+    day = ifelse(day == 0 | is.na(day), 1, day),
+    date = as.Date(paste(year, month, day, sep = "-"), format = "%Y-%m-%d")
+  ) %>%
+  # Create severity index
+  mutate(
+    severity_index = nkill + 0.5 * nwound,
+    severity_category = case_when(
+      severity_index == 0 ~ "No casualties",
+      severity_index <= 5 ~ "Low",
+      severity_index <= 20 ~ "Medium",
+      severity_index <= 50 ~ "High",
+      TRUE ~ "Extreme"
+    )
+  )
+
+# Create a version of the dataset with both original and capped values for analysis
+df_analysis <- df
+
+# Check the result of data cleaning
+glimpse(df_analysis)
+
+# Verify missing values after cleaning
+missing_after <- colSums(is.na(df_analysis))
+print(missing_after)
+
+# After fully cleaning the data 
+nrow(df_analysis)
+
+```
+
+EXPLORATORY DATA ANALYSIS (EDA)
+
+# 1. Data Overview
+
+#1.1 Attack type Distribution
+
+Depicting the distribution of various types of attacks, using the ggplot library in the form of a histogram. We can see how much more the count of bombing/explosion is compared to others, with hijacking having the lowest count. Hostage taking and uhnarmed assault also have one of the lowest counts.
+
+```{r}
+ggplot(data = df, aes(x = df$attacktype)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +   
+  geom_histogram(stat = "count") +
+  labs(title='Terrorism attack type distribution')
+```
+#1.2 Target Distribution
+
+Let's get an idea of what kind of targets terrorists hit. The visualization graph depicts a histogram, containing the target distribution of terrorism. The demographic/group most targeted are the private citizens and property, with the military coming a close second. The lowest count is attributed to the educational institutions, with number of attacks being a mere 4322 compared to the 43511 of private citizens and property.
+```{r}
+#visual
+ggplot(data=df, aes(x=target_type, fill=decade)) +
+  geom_histogram(stat='count') +
+  theme(axis.text.x= element_text(angle=45, hjust=1)) +
+  labs(title='Target distribution of terrorism over time')
+
+#table
+df %>%
+  group_by(target_type) %>%
+  summarise(nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+```
+
+#1.3 location of terrorism (regions/countries/cities)
+
+We want to see where the terrorist attacks happen around the world. For this we'll use the ggplot package. The results signify two colours' dots. They show the parts of the world where terrorism attacks have happened. The red dots mean deadlier killings compared to blue ones. This plot does not include the terror attacks prior to 2007. It only accounts for the attacks over the last decade (2007-2017).
+
+```{r}
+# For plotting clarity lets just check out attacks from the last decade and onwards.
+df2000 <- df %>%
+  filter(year > 2006)
+
+world <- borders("world", colour="gray50", fill="gray50") 
+worldmap <- ggplot() + world + scale_y_continuous(limits=c(-55, 90))
+
+worldmap + 
+  geom_point(aes(x=df2000$longitude[df$nkill<51], y=df2000$latitude[df$nkill<51]), col='blue', alpha= 0.2) +
+  geom_point(aes(x=df2000$longitude[df$nkill>50], y=df2000$latitude[df$nkill>50]), col='red', size=2) +
+  labs(title='Location of terrorist attacks by severity')
+```
+
+
+# 1.4 Location distribution
+
+Let's view the top 10 locations for terrorist attacks by region, country and city. The top location for terror attacks is Baghdad in Iraq. It has a count of a whopping 7589, almost 5000 count more than the second most attacked city, Karachi in Pakistan. This analysis is done taking into account the regions, countries and cities mentioned in the dataset.
+
+```{r}
+df %>%
+  group_by(region) %>%
+  summarise( nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+
+df %>%
+  group_by(country) %>%
+  summarise( nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+
+df %>%
+  filter(city != 'Unknown') %>%
+  group_by(city) %>%
+  summarise( nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+```
+
+# 1.5 distribution of terrorist groups
+
+We study which terrorist groups are doing these attacks, in the form of a histogram using the ggplot library. The group that committed the highest number of terrorist attacks happens to be the Taliban, with the count topping over 7000 attacks. The lowest attacks are done by the Boko Haram and Kurdistan Workers' Party. However, these are only the top 10 groups accounted for in this plot.
+
+```{r}
+#table
+top10_groups <- df %>%
+  filter(group_name != "Unknown") %>%
+  group_by(group_name) %>%
+  summarise(nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+
+#visual
+ggplot(data=top10_groups) +
+  stat_summary(aes(x=group_name, y=nr_of_attacks), geom="bar") +
+  theme(axis.text.x= element_text(angle=45, hjust=1)) +
+  labs(title='Terrorist attacks per group')
+```
+
+#2. Trends in terorrism 
+##2.1 Terrorism growth
+
+See below for decade breakdown - significant increase since 2010. THe years range froms the 70s to the 2010s. We use ggplot library to plot a histogram of the increase in terrorism attacks over the years. With the lowest count in 1971 and 1973, the highest count is a stark contrast, reaching a peak in the year 2014. Many factors contribute to this statistic, including population growth.
+```{r}
+#table
+df %>%
+  group_by(decade) %>%
+  summarise(nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%head(n=10)  
+
+#visual
+ggplot(data=df, aes(x=year, fill=decade)) +
+  geom_histogram(stat='count') +  
+  theme(axis.text.x= element_text(angle=45, hjust=1)) +
+  labs(title='Terrorism growth over time')
+
+```
+
+# 2.2 Locations of terrorism
+
+This is the histogram plot of the top 20 countries attacked by terrorists. Middle East and North Africa (~27% of total), South Asia (~24%) and South America (11%) are the top three regions in terms of number of attacks. Iraq (~12.9% of total), Pakistan(~8%), Afghanistan (~6.6%), India(~6.4%) and Colombia (4.7%) are the top five countries in terms of number of attacks.   
+
+```{r}
+#table
+top20_countries <- df %>%
+  group_by(region, country) %>%
+  summarise(nr_of_attacks = n()) %>%
+  mutate(percent = nr_of_attacks/sum(nr_of_attacks))%>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=20)
+
+#visual by country
+ggplot(data=top20_countries) +
+  stat_summary(aes(x=country, y=nr_of_attacks, fill=region), geom="bar") +
+  theme(axis.text.x= element_text(angle=45, hjust=1)) + 
+  labs(title='Amount of terrorist attacks per country and region')
+```
+
+# 2.3 Has terrorism become deadlier?
+
+The plot depicts how attacks have become more and more deadly over the years. Explosive attacks have increased exponentially. Over half of all deaths by terrorist attack have occurred during bomb attacks. The next deadliest weapon grouping is "Firearms" responsibile for ~32% of all Terror attack deaths. Lowest is accounted for the sabotage equipment.
+```{r}
+#table
+weapon_lethality <- df %>%
+  filter(weapon_type != "Unknown") %>%
+  select(decade, weapon_type, nkill)%>%
+  group_by(decade,weapon_type)%>%
+  summarise(nr_of_deaths = n())%>%
+  top_n(n=5, wt=nr_of_deaths) %>%
+  mutate(percent_deaths = (nr_of_deaths/sum(nr_of_deaths)*100))
+
+#Visual by decade / weapon type
+ggplot(data=weapon_lethality, aes(x=decade, y=nr_of_deaths, col=weapon_type, group= weapon_type)) +
+  geom_line(size=1.5, alpha=0.5) + 
+  labs(title='Terrorism lethality by weapon over time')
+```
+
+
+# 2.4 Activity of groups over time
+
+First we identify the top ten Terror Groups in terms of number of attacks. This plot is different than a histogram as it shows the exact increase of decrease of activity. Here we see how the attacks by Islamic State of Iraq and the Levant (ISIL) have grown exponentially in the 2010s.
+
+```{r}
+top10_groups <- df %>%
+  filter(group_name != "Unknown") %>%
+  group_by(group_name) %>%
+  summarise(nr_of_attacks = n()) %>%
+  arrange(desc(nr_of_attacks)) %>%
+  head(n=10)
+
+top10_groups
+
+#table
+top10_groups_activity <- df %>%
+filter(df$group_name %in% c("Taliban", "Shining Path (SL)", "Islamic State of Iraq and the Levant (ISIL)", "Farabundo Marti National Liberation Front (FMLN)", "Al-Shabaab", "Irish Republican Army (IRA)", "Revolutionary Armed Forces of Colombia (FARC)", "New People's Army (NPA)", "Kurdistan Workers' Party (PKK)", "Boko Haram"))%>%  
+select(year, group_name)%>%
+group_by(year, group_name) %>%
+  summarise(nr_of_attacks = n())%>%
+  arrange(desc(nr_of_attacks))%>%
+   top_n(n=10, wt=nr_of_attacks)
+
+#Visual by Top 10 Terror Group Activity  / decade since 1970
+ggplot(data=top10_groups_activity, aes(x=year, y=nr_of_attacks, col=group_name, group= group_name)) +
+  geom_line(size=1, alpha=0.5) + 
+  theme(legend.position="right")+
+  labs(title='Terrorist Group activity over time') +
+  theme(legend.position="bottom", legend.text=element_text(size=3.5))
+```
+
+# 2.5 Weapon choice over time
+
+Did technology growth change what weapons terrorist use? Explosives and firearms remain the top weapons throughout the years. The lowest (almost non existent) weapons are chemical weapons, which are probably capable of wiping out the entire human race, are non-arguably the least used.
+
+```{r}
+dfweapons <- df %>%
+  select(year, weapon_type, decade) %>%
+  filter(weapon_type != "Unknown")
+
+#table
+top15_weapons <- dfweapons %>%
+  group_by(decade, weapon_type) %>%
+  summarise(nr_of_attacks = n()) %>%
+  top_n(n=5, wt=nr_of_attacks) %>%
+  mutate(percent = nr_of_attacks/sum(nr_of_attacks)*100) %>%
+  arrange(decade, desc(nr_of_attacks))
+
+#visual
+ggplot(data=top15_weapons, aes(x=decade, y=percent, col=weapon_type, group= weapon_type)) +
+  geom_line(size=1.5, alpha=0.5) +
+  labs(title='Weapon choice of terrorists over time')
+```
+
+
+# 2.6 Target choice over time
+
+Have the targets changed? Have terrorists changed what targets they use? The graph depicts that the top targets in the 70s were businesses, which were overtaken by the private citizens and property by the end (2010s). Military attacks were pretty low too but now they are the 2nd most attacked groups.
+
+```{r}
+dftargets <- df %>%
+  select(year, target_type, target_sub_type, decade) %>%
+  filter(target_type != "Unknown")
+
+#table
+dftargetstop <- dftargets %>%
+  group_by(decade, target_type) %>%
+  summarise(nr_of_attacks = n()) %>%
+  top_n(n=5, wt=nr_of_attacks) %>%
+  arrange(decade, desc(nr_of_attacks))
+
+#visual
+ggplot(data=dftargetstop, aes(x=decade, y=nr_of_attacks, col=target_type, group= target_type)) +
+  geom_line(size=1.5, alpha=0.5)+
+  labs(title='Terrorism targets over time')
+```
+
+
+#RESEARCH QUESTION 1
+How does the number of fatalities (nkill) vary by weapon type and target type over different years?
+
+Method: Two-way ANOVA with bootstrap resampling.
+
+
+```{r}
+head(df)
+```
+
+```{r}
+colnames(df)
+```
+checking the data types of each column
+
+```{r}
+str(df)
+```
+
+We assess the dataset for checking zeros in nkill, total non-missing nkill values, and percentage of zeros in the dataset. 
+We also create a subset pos_val of the main cleaned dataset df, that includes all the positive values and no zeroes. We are removing the zero values so that it does not lead to skewed results  or inflated Type 1 errors.
+```{r}
+# Check zeros in nkill
+sum(df$nkill == 0, na.rm = TRUE)
+
+# Total non-missing nkill values
+sum(!is.na(df$nkill))
+
+# Percentage of zeros
+sum(df$nkill == 0, na.rm = TRUE) / sum(!is.na(df$nkill)) * 100
+
+
+library(tidyverse)
+library(caret)      # for cross-validation
+library(boot)       # for bootstrap
+library(MASS)
+library(glmnet)
+
+df$nkill[is.na(df$nkill)] <- 0
+
+sum(df$nkill == 0)
+
+pos_val <- df %>% filter(!is.na(nkill) & nkill > 0)
+
+# Ensure pos_val is numeric
+pos_val$pos_val <- as.numeric(pos_val$nkill)
+```
+There are a lot of rare values present in the weapon_type column which in turn cause the standard error to increase. Here we collapse the rare categories to reduce the error.
+
+```{r}
+table(pos_val$weapon_type)
+# Collapse rare weapon types
+weapon_counts <- table(pos_val$weapon_type)
+rare_weapons <- names(weapon_counts[weapon_counts < 500])
+
+pos_val$weapon_type_collapsed <- as.character(pos_val$weapon_type)
+pos_val$weapon_type_collapsed[pos_val$weapon_type_collapsed %in% rare_weapons] <- "Other"
+pos_val$weapon_type_collapsed <- as.factor(pos_val$weapon_type_collapsed)
+
+# Check new levels
+table(pos_val$weapon_type_collapsed)
+```
+
+
+This code performs a two-way ANOVA with bootstrapping to assess how fatalities (pos_val) vary by weapon type, target type, and year. It first converts relevant columns to factors, then defines a function that runs ANOVA on bootstrap samples and extracts the F-statistics. The boot() function is used to repeat this process 500 times, providing estimates of variability and stability for each effect. Finally, a standard ANOVA is run for comparison, allowing interpretation of both point estimates and their reliability.
+```{r}
+# Load libraries
+library(boot)
+library(dplyr)
+
+set.seed(123)
+
+# Convert weapon_type and target_type to factors
+pos_val$weapon_type <- as.factor(pos_val$weapon_type)
+pos_val$target_type <- as.factor(pos_val$target_type)
+
+# Define the resampling function for bootstrapping
+boot_anova <- function(data, indices) {
+  boot_data <- data[indices, ]
+  
+  # Perform Two-way ANOVA: pos_val ~ weapon_type * target_type + year
+  anova_model_boot <- aov(pos_val ~ weapon_type_collapsed * target_type + factor(year), data = boot_data)
+  
+  # Extract the F-statistic and return it as a numeric vector
+  f_stat <- summary(anova_model_boot)[[1]]$`F value`
+  
+  # Return only the F-statistic
+  return(f_stat)
+}
+
+# Perform bootstrapping 
+results <- boot(data = pos_val, statistic = boot_anova, R = 100)
+
+# results
+print(results)
+
+# Alternatively, perform a standard ANOVA without resampling for comparison
+anova_model <- aov(pos_val ~ weapon_type * target_type + factor(year), data = pos_val)
+
+# Summary of the standard ANOVA
+summary(anova_model)
+
+```
+The F-statistics show how strongly each factor affects the outcome (pos_val, i.e., fatalities). Higher F-values = stronger evidence that a factor matters.
+
+In this case:
+
+F = 54.19 for weapon_type → very strong effect
+
+F = 31.32 for target_type → strong effect
+
+F = 12.38 for year → moderate but significant effect
+
+F = 16.60 for weapon_type × target_type interaction → important combined effect
+
+The number of people killed in terrorist attacks is strongly influenced by the type of weapon used, the type of target, and the year. Importantly, some weapon-target combinations are particularly deadly, highlighting the importance of considering interactions. These findings are statistically robust, as confirmed by bootstrapping.
+
+
+
+
+This interaction plot shows how average fatalities vary across combinations of weapon types and target types. Sharp peaks indicate especially deadly combinations, such as attacks on Tourists and Private Citizens & Property using Other weapons. Overall, while most combinations result in moderate fatalities, a few stand out with significantly higher impact.
+
+```{r}
+heat_data <- pos_val %>%
+  group_by(weapon_type_collapsed, target_type) %>%
+  summarise(mean_fatalities = mean(pos_val))
+
+ggplot(heat_data, aes(x = weapon_type_collapsed, y = target_type, fill = mean_fatalities)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "lightyellow", high = "red") +
+  labs(title = "Heatmap of Mean Fatalities",
+       x = "Weapon Type (Collapsed)",
+       y = "Target Type",
+       fill = "Mean Fatalities") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+This heatmap shows the average number of fatalities across different combinations of weapon types and target types. Darker red cells indicate combinations that resulted in higher mean fatalities per incident, such as attacks on Private Citizens & Property with Other weapons. Most combinations result in lower fatalities (lighter shades), highlighting that only specific pairings lead to especially deadly outcomes.
+
+ 
+
+
+# Research Question 2:
+Is there a significant difference in the number of casualties caused by different terrorist groups across regions over time?
+Method: Two-way ANOVA (Analysis of multi-factor experiments), Random Forest, Logistic Regression
+
+This code builds classification models to predict whether a terrorist attack is part of a coordinated (multiple) attack using features like attack type, target type, region, group name, and casualty counts. It uses both logistic regression and random forest models without applying hyperparameter tuning or SMOTE. The data is preprocessed, split into training and testing sets, and evaluated using confusion matrices, ROC curves, and AUC scores. Cross-validation is performed to assess the generalizability of each model. The results help identify whether specific attack patterns or group characteristics are associated with coordinated attacks.
+
+```{r}
+# Load packages
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+library(ROCR)
+
+# 1. Prepare the dataset --------------------------------------------
+
+# Select relevant columns 
+df_model <- df %>%
+  dplyr::select(multiple_attack, attacktype, target_type, group_name, region, nkill, nwound)
+
+# Convert categorical predictors to factors
+df_model <- df_model %>%
+  mutate(across(c(attacktype, target_type, group_name, region), as.factor),
+         multiple_attack = factor(multiple_attack, levels = c(0, 1), labels = c("No", "Yes")))  # relabel for caret compatibility
+
+# simplify group_name by keeping only top frequent groups
+top_groups <- names(sort(table(df_model$group_name), decreasing = TRUE)[1:20])
+df_model$group_name <- ifelse(df_model$group_name %in% top_groups, df_model$group_name, "Other")
+df_model$group_name <- as.factor(df_model$group_name)
+
+# 2. Train/Test Split -----------------------------------------------
+
+set.seed(123)
+trainIndex <- createDataPartition(df_model$multiple_attack, p = 0.8, list = FALSE)
+train <- df_model[trainIndex, ]
+test <- df_model[-trainIndex, ]
+
+# 3. Logistic Regression --------------------------------------------
+
+log_model <- glm(multiple_attack ~ ., data = train, family = "binomial")
+summary(log_model)
+
+# Predict on test set
+log_probs <- predict(log_model, newdata = test, type = "response")
+log_preds <- ifelse(log_probs > 0.5, "Yes", "No")  # match factor levels
+log_preds <- factor(log_preds, levels = levels(test$multiple_attack))  # ensure matching levels
+
+# Confusion Matrix
+confusionMatrix(log_preds, test$multiple_attack)
+
+# ROC Curve
+roc_log <- roc(response = test$multiple_attack, predictor = log_probs, levels = c("No", "Yes"))
+plot(roc_log, col = "blue", main = "ROC Curve - Logistic Regression")
+auc(roc_log)
+
+# 4. Random Forest --------------------------------------------------
+
+set.seed(123)
+rf_model <- randomForest(multiple_attack ~ ., data = train, ntree = 100, importance = TRUE)
+print(rf_model)
+
+# Predict and evaluate
+rf_preds <- predict(rf_model, newdata = test)
+confusionMatrix(rf_preds, test$multiple_attack)
+
+# ROC for RF
+rf_probs <- predict(rf_model, newdata = test, type = "prob")[, "Yes"]
+roc_rf <- roc(response = test$multiple_attack, predictor = rf_probs, levels = c("No", "Yes"))
+plot(roc_rf, col = "darkgreen", add = TRUE)
+legend("bottomright", legend = c("Logistic", "Random Forest"), col = c("blue", "darkgreen"), lwd = 2)
+
+# AUC
+auc(roc_rf)
+
+# 5. Cross-validation (Logistic) ------------------------------------
+
+set.seed(123)
+cv_ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+log_cv <- train(multiple_attack ~ ., data = train, method = "glm", family = "binomial", trControl = cv_ctrl, metric = "ROC")
+log_cv
+
+# 6. Cross-validation (Random Forest - Using ranger) ----------------
+
+# cv control 
+cv_ctrl <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE
+)
+
+# Train using ranger with fewer trees for speed
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# run the ranger model
+set.seed(123)
+rf_cv <- train(
+  multiple_attack ~ ., 
+  data = train, 
+  method = "ranger", 
+  trControl = cv_ctrl, 
+  metric = "ROC",
+  num.trees = 100
+)
+
+stopCluster(cl)
+```
+
+This section uses two-way ANOVA to examine how total casualties vary by terrorist group and region, including their interaction. A new casualties variable is created by combining killed and wounded counts. An interaction plot visualizes patterns, and Tukey's HSD tests identify significant group and region differences. This adds statistical evidence to support differences in attack severity across groups and locations.
+
+```{r}
+rf_cv
+```
+```{r}
+# Create a new column for total casualties
+df_model$casualties <- df_model$nkill + df_model$nwound
+
+# Run two-way ANOVA
+anova_result <- aov(casualties ~ group_name * region, data = df_model)
+summary(anova_result)
+
+# Plot the interaction
+interaction.plot(df_model$region, df_model$group_name, df_model$casualties)
+
+tukey_group <- TukeyHSD(anova_result, which = "group_name")
+tukey_region <- TukeyHSD(anova_result, which = "region")
+```
+
+
+
+WITH HYPERPARAMETER AND TUNING
+
+This code builds classification models to predict whether a terrorist attack is part of a coordinated (multiple) attack, using SMOTE to handle class imbalance and hyperparameter tuning to optimize model performance. First, categorical predictors are converted to numeric, and the data is split into training and test sets. SMOTE (Synthetic Minority Oversampling Technique) is applied using the themis package to balance the classes in the training data. A logistic regression model is trained on the balanced data, and its performance is evaluated using a confusion matrix and ROC curve on the original test set.
+
+Next, a random forest model is trained on the SMOTE-balanced data with 3-fold cross-validation and hyperparameter tuning for the mtry value (number of variables tried at each split). The training is accelerated using parallel processing. The tuned random forest is then evaluated on the test set using accuracy metrics and AUC from the ROC curve. This approach improves model fairness and predictive power by addressing class imbalance and optimizing model settings. Overall, the code ensures a more robust and accurate prediction of multiple attacks using modern ML best practices.
+
+```{r}
+
+```
+
+
+```{r}
+# === Random Forest with SMOTE + Hyperparameter Tuning to Handle Imbalance ===
+
+# Load libraries
+library(tidyverse)
+library(caret)
+library(pROC)
+library(themis)
+library(recipes)
+library(doParallel)
+
+# Step 1: Prepare the dataset
+
+# Convert categorical variables to numeric for SMOTE
+df_model <- df_model %>%
+  mutate(across(c(attacktype, target_type, group_name, region), ~ as.integer(as.factor(.))))
+
+# Create training and test sets
+set.seed(123)
+trainIndex <- createDataPartition(df_model$multiple_attack, p = 0.8, list = FALSE)
+train_set <- df_model[trainIndex, ]
+test_set <- df_model[-trainIndex, ]
+
+# SMOTE using themis + recipes
+rec <- recipe(multiple_attack ~ ., data = train_set) %>%
+  step_smote(multiple_attack, over_ratio = 1.0)
+
+rec_prep <- prep(rec, verbose = FALSE)
+train_balanced <- juice(rec_prep)
+
+# Check class balance before and after
+cat("Original class distribution:\n")
+print(table(train_set$multiple_attack))
+cat("Balanced class distribution after SMOTE:\n")
+print(table(train_balanced$multiple_attack))
+
+# Logistic Regression on SMOTE data
+log_model_smote <- glm(multiple_attack ~ ., data = train_balanced, family = "binomial")
+summary(log_model_smote)
+
+# Predict and evaluate on test set
+log_probs_smote <- predict(log_model_smote, newdata = test_set, type = "response")
+log_preds_smote <- ifelse(log_probs_smote > 0.5, "Yes", "No")
+log_preds_smote <- factor(log_preds_smote, levels = c("No", "Yes"))
+confusionMatrix(log_preds_smote, factor(test_set$multiple_attack, levels = c("No", "Yes")))
+
+# ROC
+roc_log_smote <- roc(response = factor(test_set$multiple_attack, levels = c("No", "Yes")), 
+                     predictor = log_probs_smote, levels = c("No", "Yes"))
+plot(roc_log_smote, col = "blue", main = "ROC - Logistic Regression (SMOTE)")
+auc(roc_log_smote)
+
+# Tuned Random Forest on SMOTE data
+# Enable parallel processing to speed up training
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+cv_ctrl <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE
+)
+
+set.seed(123)
+rf_model_smote <- train(
+  multiple_attack ~ .,
+  data = train_balanced,
+  method = "rf",
+  trControl = cv_ctrl,
+  metric = "ROC",
+  tuneGrid = expand.grid(mtry = c(2, 4, 6)),
+  ntree = 100
+)
+
+stopCluster(cl)
+print(rf_model_smote)
+
+# Predict and evaluate
+rf_preds_smote <- predict(rf_model_smote, newdata = test_set)
+confusionMatrix(rf_preds_smote, factor(test_set$multiple_attack, levels = c("No", "Yes")))
+
+# ROC
+rf_probs_smote <- predict(rf_model_smote, newdata = test_set, type = "prob")[, "Yes"]
+roc_rf_smote <- roc(response = factor(test_set$multiple_attack, levels = c("No", "Yes")), 
+                    predictor = rf_probs_smote, levels = c("No", "Yes"))
+plot(roc_rf_smote, col = "darkgreen", main = "ROC - Tuned Random Forest (SMOTE)")
+auc(roc_rf_smote)
+```
+
+
+
+#RESEARCH QUESTION 3:
+How Can We Forecast Future Trends in the Frequency and Severity of Global Terrorist Attacks?
+
+Method: Time-series forecasting
+
+The code performs data preprocessing and feature engineering on the terrorism dataset along with associated population data. It starts by loading the needed libraries and reading in the terrorism and population CSV files. Then, it filters and cleans the population data, and selects relevant columns from the terrorism dataset while renaming them for clarity. It handles missing values through imputation, fixes geographical coordinates by imputing medians at various geographic levels, and caps outliers for several key numeric variables. Finally, it creates new features such as a severity index and date fields, categorizes severity into bins, and prepares the cleaned dataset (df_analysis) for further analysis.
+
+```{r}
+
+
+# Load required libraries
+library(tidyverse)
+library(gridExtra)
+library(readr)
+library(ggmap)
+library(rworldmap)
+library(arules)
+library(arulesViz)
+library(ggpubr)
+library(car)
+library(caret)
+library(forecast)
+library(zoo)
+library(ggfortify)
+library(naniar) 
+
+# Load datasets
+fulldf <- read_csv("/Users/atharvraotole/Desktop/globalterr/globalterrorismdb_0718dist.csv")
+fullpop <- read_csv("/Users/atharvraotole/Desktop/globalterr/UNpopfile.csv")
+
+# Process population data
+pop <- fullpop %>%
+  select(-MidPeriod, -PopMale, -PopFemale, -VarID) %>%
+  filter(Time > 1969 & Variant == 'Medium' & Time < 2017) %>%
+  select(-Variant, -LocID)
+
+futurepop <- fullpop %>%
+  filter(Time > 2016 & Variant == 'Medium') %>%
+  select(-Variant, -LocID, -MidPeriod, -PopMale, -PopFemale, -VarID)
+
+# ------------------------------------------------------------------------------
+# 1. SELECT AND RENAME COLUMNS
+#    Including property damage and hostage columns for extended severity analysis
+# ------------------------------------------------------------------------------
+df <- fulldf %>%
+  select(
+    # Date/time info
+    iyear, imonth, iday,
+    # Geographic info
+    country_txt, region_txt, city, latitude, longitude,
+    # Incident descriptions
+    summary, multiple,
+    # Attack/target info
+    attacktype1_txt, targtype1_txt, targsubtype1_txt, gname, weaptype1_txt,
+    # Casualties
+    nkill, nwound, nkillter,
+    # Property damage columns
+    property, propextent, propextent_txt, propvalue, propcomment,
+    # Hostage/kidnapping columns
+    ishostkid, nhostkid
+  ) %>%
+  rename(
+    year = iyear,
+    month = imonth,
+    day = iday,
+    country = country_txt,
+    region = region_txt,
+    multiple_attack = multiple,
+    attacktype = attacktype1_txt,
+    target_type = targtype1_txt,
+    target_sub_type = targsubtype1_txt,
+    group_name = gname,
+    weapon_type = weaptype1_txt
+  )
+
+# ------------------------------------------------------------------------------
+# 2. CREATE A DECADE VARIABLE
+# ------------------------------------------------------------------------------
+df <- df %>%
+  mutate(
+    decade = case_when(
+      year < 1980 ~ "70s",
+      year < 1990 ~ "80s",
+      year < 2000 ~ "90s",
+      year < 2010 ~ "2000s",
+      TRUE        ~ "2010s"
+    )
+  )
+
+df$decade <- factor(df$decade, levels = c("70s", "80s", "90s", "2000s", "2010s"))
+
+# ------------------------------------------------------------------------------
+# 3. CHECK FOR MISSING VALUES
+# ------------------------------------------------------------------------------
+missing_values <- colSums(is.na(df))
+print(missing_values)
+
+# ------------------------------------------------------------------------------
+# 4. HANDLE MISSING VALUES
+#    Replace NA in categorical columns, median-impute numeric columns, etc.
+# ------------------------------------------------------------------------------
+df <- df %>%
+  # Replace NA in categorical columns with "Unknown" or suitable placeholders
+  mutate(
+    group_name      = ifelse(is.na(group_name), "Unknown", group_name),
+    city            = ifelse(is.na(city), "Unknown", city),
+    target_sub_type = ifelse(is.na(target_sub_type), "Unknown", target_sub_type),
+    summary         = ifelse(is.na(summary), "No summary available", summary)
+  ) %>%
+  # Replace NA in multiple_attack with 0
+  mutate(multiple_attack = ifelse(is.na(multiple_attack), 0, multiple_attack)) %>%
+  # Replace NA in numeric columns with medians (or zeros if more appropriate)
+  mutate(
+    nkill     = ifelse(is.na(nkill), median(nkill, na.rm = TRUE), nkill),
+    nwound    = ifelse(is.na(nwound), median(nwound, na.rm = TRUE), nwound),
+    nkillter  = ifelse(is.na(nkillter), median(nkillter, na.rm = TRUE), nkillter),
+    # For property damage, set propvalue=0 if missing
+    propvalue = ifelse(is.na(propvalue), 0, propvalue),
+    # For property indicator (0 or 1), if missing, assume no property damage
+    property  = ifelse(is.na(property), 0, property),
+    # For hostage columns, set ishostkid=0 if missing, likewise for nhostkid
+    ishostkid = ifelse(is.na(ishostkid), 0, ishostkid),
+    nhostkid  = ifelse(is.na(nhostkid), 0, nhostkid)
+  )
+
+# ------------------------------------------------------------------------------
+# 5. HANDLE MISSING COORDINATES (latitude, longitude)
+# ------------------------------------------------------------------------------
+df <- df %>%
+  mutate(coords_missing = is.na(latitude) | is.na(longitude))
+
+df <- df %>%
+  group_by(country) %>%
+  mutate(
+    latitude  = ifelse(is.na(latitude), median(latitude, na.rm = TRUE), latitude),
+    longitude = ifelse(is.na(longitude), median(longitude, na.rm = TRUE), longitude)
+  ) %>%
+  ungroup()
+
+df <- df %>%
+  group_by(region) %>%
+  mutate(
+    latitude  = ifelse(is.na(latitude), median(latitude, na.rm = TRUE), latitude),
+    longitude = ifelse(is.na(longitude), median(longitude, na.rm = TRUE), longitude)
+  ) %>%
+  ungroup()
+
+global_lat_median  <- median(df$latitude, na.rm = TRUE)
+global_long_median <- median(df$longitude, na.rm = TRUE)
+
+df <- df %>%
+  mutate(
+    latitude  = ifelse(is.na(latitude), global_lat_median, latitude),
+    longitude = ifelse(is.na(longitude), global_long_median, longitude)
+  )
+
+# ------------------------------------------------------------------------------
+# 6. HANDLE OUTLIERS VIA CAPPING 
+# ------------------------------------------------------------------------------
+cap_outliers <- function(x, lower_quantile = 0.05, upper_quantile = 0.95) {
+  qnt <- quantile(x, probs = c(lower_quantile, upper_quantile), na.rm = TRUE)
+  x[x < qnt[1]] <- qnt[1]
+  x[x > qnt[2]] <- qnt[2]
+  return(x)
+}
+
+df <- df %>%
+  mutate(
+    nkill_capped    = cap_outliers(nkill),
+    nwound_capped   = cap_outliers(nwound),
+    nkillter_capped = cap_outliers(nkillter),
+    propvalue_capped = cap_outliers(propvalue)
+  )
+
+# ------------------------------------------------------------------------------
+# 7. CREATE ADDITIONAL FEATURES (DATE, SEVERITY INDEX, ETC.)
+# ------------------------------------------------------------------------------
+df <- df %>%
+  mutate(
+    # Replace 0 or NA month/day with 1 for minimal date construction
+    month = ifelse(month == 0 | is.na(month), 1, month),
+    day   = ifelse(day   == 0 | is.na(day),   1, day),
+    date  = as.Date(paste(year, month, day, sep = "-"), format = "%Y-%m-%d")
+  ) %>%
+  # Create severity metrics
+  mutate(
+    # Simple casualty-based severity
+    severity_index = nkill + 0.5 * nwound,
+
+    composite_severity = nkill + 0.5 * nwound + nhostkid + (propvalue / 1e6),
+    
+    # Categorize the composite severity into bins
+    composite_severity_cat = case_when(
+      composite_severity == 0            ~ "No impact",
+      composite_severity <= 5            ~ "Low",
+      composite_severity <= 20           ~ "Medium",
+      composite_severity <= 50           ~ "High",
+      TRUE                               ~ "Extreme"
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# 8. PREP FINAL DATASET FOR ANALYSIS
+# ------------------------------------------------------------------------------
+df_analysis <- df
+
+# Examine structure and missingness post-cleaning
+
+missing_after <- colSums(is.na(df_analysis))
+
+# Number of rows retained
+nrow(df_analysis)
+
+```
+
+
+
+This code performs a time series analysis on terrorist attack data using monthly counts. It begins by loading libraries and reading a pre-cleaned terrorism dataset. The data is aggregated to compute the number of attacks per month, then converted into a time series object. The time series is split into training (80%) and test (20%) sets for forecasting purposes. Finally, it visualizes the original series with the train-test boundary and applies a 3-month moving average to smooth trends for better interpretability.
+```{r}
+# ------------------------------------------------------------------------------
+# 1. Load Required Libraries
+# ------------------------------------------------------------------------------
+library(tidyverse)
+library(forecast)
+library(lubridate)
+library(ggfortify)
+
+# ------------------------------------------------------------------------------
+# 2. Load the Dataset
+# ------------------------------------------------------------------------------
+# Adjust the file path as needed.
+fulldf <- read_csv("D:\\Stony Brook\\Statistical Computing Project\\globalterrorismdb_0718dist.csv")
+
+# ------------------------------------------------------------------------------
+# 3. Data Preprocessing
+#    We assume that the dataset has been cleaned and processed into 'df_analysis'.
+#    For our purposes, we only need the 'year' column to compute annual terrorist attack counts.
+# ------------------------------------------------------------------------------
+# Here we create an aggregated data frame counting the number of terrorist attack events per year.
+df_attacks_per_month <- df_analysis %>%
+  filter(!is.na(year)) %>%
+  group_by(year, month) %>%
+  summarise(
+    terrorist_attacks_count = n()
+  ) %>%
+  ungroup()
+
+print(df_attacks_per_month)
+
+# ------------------------------------------------------------------------------
+# 4. Create a Time Series Object for Terrorist Attacks (Monthly)
+t_attack <- ts(df_attacks_per_month$terrorist_attacks_count, 
+               start = c(min(df_attacks_per_month$year), min(df_attacks_per_month$month)), 
+               frequency = 12)
+
+
+
+
+# ------------------------------------------------------------------------------
+# 5. Train-Test Split (80% Train, 20% Test)
+# ------------------------------------------------------------------------------
+n_total <- length(t_attack)
+n_train <- floor(0.8 * n_total)
+train_ts <- window(t_attack, end = time(t_attack)[n_train + 1])
+test_ts  <- window(t_attack, start = time(t_attack)[n_train + 1])
+
+# ------------------------------------------------------------------------------
+# 6. Visualize the Raw Series and Train/Test Boundary
+# ------------------------------------------------------------------------------
+plot(t_attack, main = "Terrorist Attack Time Series (Train/Test Split)", ylab = "Attack Count")
+abline(v = time(t_attack)[n_train], col = "red", lty = 2)
+legend("topleft", legend = c("Time Series", "Train/Test Boundary"),
+       col = c("black", "red"), lty = c(1,2))
+
+# ------------------------------------------------------------------------------
+# 7. Smooth the Time Series Using a Moving Average 
+# ------------------------------------------------------------------------------
+t_attack_trend <- stats::filter(t_attack, rep(1/3, 3), sides = 2)
+ts.plot(t_attack, t_attack_trend, col = c("grey", "blue"), lty = 1:2,
+        main = "Raw vs Smoothed Terrorist Attack Trends",
+        ylab = "Attack Count")
+legend("topleft", legend = c("Raw", "Smoothed"), col = c("grey", "blue"), lty = 1:2)
+
+
+```
+
+This code fits a Triple Exponential Smoothing (ETS) model to the training data to forecast terrorist attack counts. It generates predictions for both the test period and an additional 10 months into the future. Model performance is evaluated using Mean Absolute Percentage Error (MAPE) and autocorrelation of residuals (ACF1). Actual and predicted values are then organized into data frames and visualized using ggplot2, with color-coded lines distinguishing between train, test, test predictions, and future forecasts.
+```{r}
+  best_model <- ets(train_ts, model = "MMM")
+  summary(best_model)
+  
+  
+  # Forecast using the ETS model
+  h <- length(test_ts) + 10  # forecast horizon: test period plus extra 10 time periods
+  fcast <- forecast(best_model, h = h, level = c(80, 95))
+  
+  # ------------------------------------------------------------------------------
+  # 10. Evaluate Model Accuracy on the Test Data
+  # ------------------------------------------------------------------------------
+  # Extract the predictions corresponding to the test period
+  pred_test <- fcast$mean[1:length(test_ts)]
+  model_accuracy <- accuracy(pred_test, test_ts)
+  print(model_accuracy)
+  
+  cat("\nETS Model Performance on Test Data:\n")
+
+  cat(sprintf("\nMean Absolute Percentage Error (MAPE): %.2f%%", model_accuracy["Test set", "MAPE"]))
+  cat(sprintf("\nAutocorrelation of Residuals (ACF1): %.4f\n", model_accuracy["Test set", "ACF1"]))
+  
+  
+  # ------------------------------------------------------------------------------
+# 11. Combine Data for Plotting: Actual vs. Predicted Terrorist Attack Counts
+# ------------------------------------------------------------------------------
+# Prepare a data frame for the full actual series (train and test periods)
+df_actual <- tibble(
+  Year = as.numeric(time(t_attack)),
+  Attack_Count = as.numeric(t_attack),
+  Type = ifelse(as.numeric(time(t_attack)) <= max(as.numeric(time(train_ts))), "Train", "Test")
+)
+
+# Prepare a data frame for predictions (test period predictions and extended forecast)
+forecast_years <- as.numeric(time(fcast$mean))
+df_pred <- tibble(
+  Year = forecast_years,
+  Prediction = as.numeric(fcast$mean),
+  Type = c(rep("Test Prediction", length(test_ts)), rep("Forecast", 10))
+)
+
+
+
+
+
+
+  # ------------------------------------------------------------------------------
+  # 12. Plot the Actual vs. Forecasted Terrorist Attack Counts using ggplot2
+  # ------------------------------------------------------------------------------
+  # Adjust the plotting area directly in your interactive session
+  options(repr.plot.width = 30, repr.plot.height = 6)
+  
+  # Recreate your plot with adjusted dimensions
+  p <- ggplot() +
+    geom_line(data = df_actual,
+              aes(x = Year, y = Attack_Count, color = Type),
+              size = 1) +
+    geom_line(data = df_pred,
+              aes(x = Year, y = Prediction, color = Type),
+              size = 1) +
+    labs(title = "Terrorist Attacks: Train, Test, Predictions & Forecast (ETS Model)", 
+         x = "Year", 
+         y = "Attack Count") +
+    theme_minimal() +
+    scale_color_manual(values = c("Train" = "black", 
+                                  "Test" = "orange", 
+                                  "Test Prediction" = "darkgreen", 
+                                  "Forecast" = "blue")) +
+    theme(legend.position = c(0.05, 0.95),
+          legend.justification = c("left", "top"),
+          legend.background = element_rect(fill = alpha("white", 0.5)))
+  
+  # Display the adjusted plot
+  print(p)
+
+
+```
+
+
+This code fits an ETS model (MMM) to the training data up to December 2016 and forecasts terrorist attacks for the next 48 months. The forecast is generated with 90% and 95% confidence intervals. The resulting plot shows the forecasted values starting in 2017, with the original time series overlaid in black for context. The x-axis is limited to start from 2010 to provide historical perspective alongside the forecast.
+```{r}
+library(forecast)
+
+# Define the training data as all data up to December 2016
+train_ts <- window(t_attack, end = c(2016, 12))
+
+# Manually specify the forecast horizon (e.g., 48 months after 2016)
+forecast_horizon <- 48
+
+# Fit the ETS model to the training data.
+best_model <- ets(train_ts, model = "MMM")
+
+
+# Generate the forecast starting from 2017 (after 2016) fo  r the specified horizon.
+fcast <- forecast(best_model, h = forecast_horizon, level = c(90, 95))
+
+# Determine the ending time from the forecast object for the x-axis limit.
+end_time <- time(fcast$mean)[length(fcast$mean)]
+
+# Plot the forecast with the x-axis starting at 2010
+plot(fcast, 
+     main = "Forecast of Global Terrorist Attacks (ETS) Starting after 2016", 
+     xlab = "Year", 
+     ylab = "Attack Count",
+     xlim = c(2010, end_time))
+
+# Overlay the full original time series (displayed in black)
+lines(t_attack, col = "black")
+
+
+```
+
