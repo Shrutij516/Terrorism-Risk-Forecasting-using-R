@@ -11,7 +11,7 @@ Key Methods:
 
 1. Exploratory Data Analysis (EDA) & Visualizations
 2. Statistical Tests (Two-way ANOVA with Bootstrap Resampling)
-3. Regression Models
+3. Regression Models (Logistic Regression and Random Forest)
 4. Time Series Forecasting (ETS Model)
 5. SMOTE-Enhanced Binary Classification (Logistic Regression & Random Forest)
 
